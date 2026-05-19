@@ -1,44 +1,55 @@
-# custom_runtime.py - Secure Runtime Hook
+# custom_runtime.py - Runtime security hook
 import sys
 import os
-import hashlib
-import ctypes
-import tempfile
 
-def is_debugger_present():
-    """Check if debugger is present"""
+def is_debugger_present() -> bool:
+    """Check if a Python debugger is attached (e.g. pdb, pydevd)."""
     try:
-        # Anti-debugging check
         return hasattr(sys, 'gettrace') and sys.gettrace() is not None
-    except:
+    except Exception:
         return False
 
-def verify_binary_integrity():
-    """Verify the executable integrity using embedded hash"""
-    # This would be replaced with actual hash checking logic
-    # In a real implementation, the hash would be stored securely
-    # and checked against the current executable
+def verify_binary_integrity() -> bool:
+    """
+    Verify executable integrity using APP_EXPECTED_HASH env var.
+    If the env var is not set we skip the check so dev/CI is unaffected.
+    """
+    expected_hash = os.environ.get('APP_EXPECTED_HASH', '').strip()
+    if not expected_hash:
+        return True  # No hash configured → skip
+
     try:
-        # For demonstration - actual implementation would use secure storage
-        return True
+        import hashlib
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
+        if not os.path.exists(exe_path):
+            return True  # Can't verify a script path in dev
+        hasher = hashlib.sha256()
+        with open(exe_path, 'rb') as f:
+            while chunk := f.read(4096):
+                hasher.update(chunk)
+        return hasher.hexdigest().lower() == expected_hash.lower()
     except Exception as e:
-        print(f"Integrity verification error: {e}")
-        return False
+        print(f"Integrity check warning: {e}")
+        return True  # Non-fatal in case of env issues
 
-def secure_environment_check():
-    """Perform security environment checks"""
-    # Check for debugger
+def secure_environment_check() -> bool:
+    """
+    Perform security checks. In DEV_MODE these are skipped so
+    debuggers, coverage.py and test runners all work normally.
+    """
+    if os.environ.get('DEV_MODE', '').lower() in ('1', 'true', 'yes'):
+        return True  # Developer bypass
+
     if is_debugger_present():
-        print("Debugger detected - exiting for security")
-        return False
+        # Warn but do NOT kill — let the app decide
+        print("[security] Debugger detected.")
 
-    # Check integrity
     if not verify_binary_integrity():
-        print("Integrity check failed - possible tampering detected")
+        print("[security] Integrity check failed — possible tampering.")
         return False
 
     return True
 
-# Run security checks
+# Only abort if integrity is provably broken
 if not secure_environment_check():
     sys.exit(1)

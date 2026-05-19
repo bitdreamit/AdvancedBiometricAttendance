@@ -1,4 +1,6 @@
 {
+  "_comment": "Advanced Biometric Application - Configuration File",
+  "_instructions": "Replace ALL placeholder values before running. See README.md for full instructions.",
   "database": {
     "path": "data/att.db",
     "auto_create": true,
@@ -8,8 +10,7 @@
     "level": "INFO",
     "file": "logs/app.log",
     "max_size_mb": 10,
-    "backup_count": 5,
-    "compress": true
+    "backup_count": 5
   },
   "sync": {
     "interval_seconds": 300,
@@ -19,31 +20,31 @@
   },
   "devices": [
     {
+      "_comment": "Replace ip and serial_number with your actual device values",
       "ip": "192.168.1.201",
       "port": 4370,
-      "serial_number": "DEVICE_SERIAL_NUMBER",
+      "serial_number": "YOUR_DEVICE_SERIAL",
       "name": "Main Entrance Device",
-      "enabled": true,
-      "timeout": 30
+      "enabled": false,
+      "timeout": 30,
+      "sync_time": true
     }
   ],
   "server": {
-    "url": "https://your-academy.example.com/",
-    "api_key": "your_api_key_here",
-    "sync_enabled": true,
+    "_comment": "Replace url and api_key with your server details. Leave url blank to disable sync.",
+    "url": "",
+    "api_key": "",
+    "sync_enabled": false,
     "verify_ssl": true,
     "timeout": 30
   },
   "security": {
     "encryption_enabled": false,
-    "integrity_check": true,
-    "auto_update": false
+    "integrity_check": false
   },
   "application": {
     "auto_start": false,
     "minimize_to_tray": true,
-    "check_for_updates": true,
-    "auto_connect_devices": true,
     "language": "en"
   }
 }

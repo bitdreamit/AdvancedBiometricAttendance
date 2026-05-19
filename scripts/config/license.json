@@ -1,11 +1,11 @@
 {
-  "license_key": "8165F91F722311A72629A61803353B09",
+  "license_key": "8D240578AA172D8DEC972F8F7FA02253",
   "customer_name": "Trial User",
   "device_count": 1,
   "max_devices": 1,
-  "issued_date": "2025-08-24T18:20:09.023849",
-  "expiry_date": "2025-09-23T18:20:09.023849",
-  "valid_days": 30,
+  "issued_date": "2026-05-19T19:19:59.901855",
+  "expiry_date": "2027-05-19T19:19:59.901855",
+  "valid_days": 365,
   "activated": true,
   "version": "1.0",
   "type": "trial"

@@ -1,91 +1,89 @@
 # generate_license.py
 import sys
 import os
-from pathlib import Path
 
-# Add the parent directory to Python path to import your modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def generate_license():
-    """Interactive license key generation script"""
     print("=" * 50)
     print("Advanced Biometric Application - License Generator")
     print("=" * 50)
 
     try:
-        # Try to import the LicenseManager
         from src.utils.license_manager import LicenseManager
+    except ImportError:
+        print("ERROR: Could not import LicenseManager.")
+        print("Ensure src/utils/license_manager.py exists and Python path is correct.")
+        sys.exit(1)  # FIX: exit with error code so scripts can detect failure
 
-        # Get user input
-        print("\nPlease enter license details:")
+    try:
+        print("\nEnter license details:")
         customer_name = input("Customer Name/Email: ").strip()
+        if not customer_name:
+            print("ERROR: Customer name is required.")
+            sys.exit(1)
 
         while True:
             try:
                 device_count = int(input("Number of Devices: ").strip())
                 if device_count > 0:
                     break
-                else:
-                    print("Please enter a positive number.")
+                print("Please enter a positive number.")
             except ValueError:
                 print("Please enter a valid number.")
 
         while True:
             try:
-                days_valid = int(input("Days Valid (365 for 1 year): ").strip())
+                days_valid = int(input("Days Valid (365 for 1 year, 30 for trial): ").strip())
                 if days_valid > 0:
                     break
-                else:
-                    print("Please enter a positive number.")
+                print("Please enter a positive number.")
             except ValueError:
                 print("Please enter a valid number.")
 
-        # Generate license
         manager = LicenseManager()
         license_key = manager.generate_license(customer_name, device_count, days_valid)
 
         print("\n" + "=" * 50)
-        print("✅ LICENSE GENERATED SUCCESSFULLY!")
+        print("LICENSE GENERATED SUCCESSFULLY")
         print("=" * 50)
-        print(f"Customer: {customer_name}")
-        print(f"Devices: {device_count}")
-        print(f"Valid for: {days_valid} days")
-        print(f"License Key: {license_key}")
-        print("\n📋 License file saved to: config/license.json")
-        print("\n⚠️  Important: Share this license key with the customer.")
-        print("They need to activate it using the activation command.")
+        print(f"Customer    : {customer_name}")
+        print(f"Devices     : {device_count}")
+        print(f"Valid for   : {days_valid} days")
+        print(f"License Key : {license_key}")
+        print("\nLicense file saved to: config/license.json")
+        print("Share the license key with the customer for activation.")
 
-    except ImportError as e:
-        print(f"❌ Error: Could not import LicenseManager")
-        print(f"Make sure the file src/utils/license_manager.py exists")
-        print(f"Error details: {e}")
-
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(0)
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print(f"Unexpected error: {e}")
+        sys.exit(1)
+
 
 def show_license_info():
-    """Show current license information"""
     try:
         from src.utils.license_manager import LicenseManager
-
-        manager = LicenseManager()
-
-        if manager.license_data:
-            print("\n📄 CURRENT LICENSE INFORMATION:")
-            print("=" * 40)
-            for key, value in manager.license_data.items():
-                if key not in ['license_key']:  # Don't show full key by default
-                    print(f"{key.replace('_', ' ').title()}: {value}")
-
-            # Show partial license key for verification
-            if 'license_key' in manager.license_data:
-                license_key = manager.license_data['license_key']
-                print(f"License Key: {license_key[:8]}...{license_key[-8:]}")
-        else:
-            print("No license file found. Generate a license first.")
-
     except ImportError:
-        print("License manager not available")
+        print("License manager not available.")
+        sys.exit(1)
+
+    manager = LicenseManager()
+    if not manager.license_data:
+        print("No license found. Run: python generate_license.py")
+        return
+
+    print("\nCURRENT LICENSE INFORMATION")
+    print("=" * 40)
+    info = manager.get_license_info()
+    for key, value in info.items():
+        if key != 'license_key':
+            print(f"{key.replace('_', ' ').title():20}: {value}")
+    if 'license_key' in info:
+        k = info['license_key']
+        print(f"{'License Key':20}: {k[:8]}...{k[-8:]}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "info":

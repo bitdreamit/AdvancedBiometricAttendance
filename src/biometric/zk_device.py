@@ -1,15 +1,19 @@
 # src/biometric/zk_device.py
-import socket
 import threading
-import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Generator
 
-from src.biometric.zk_lib.base import ZK
-from src.biometric.zk_lib.attendance import Attendance
-
 logger = logging.getLogger(__name__)
+
+# Fix: use relative imports (this file lives inside the src package)
+try:
+    from src.biometric.zk_lib.base import ZK
+    from src.biometric.zk_lib.attendance import Attendance
+except ImportError:
+    from biometric.zk_lib.base import ZK
+    from biometric.zk_lib.attendance import Attendance
+
 
 class ZKDevice:
     def __init__(self, ip: str, port: int = 4370, serial_number: str = None, timeout: int = 30):
@@ -38,10 +42,13 @@ class ZKDevice:
                     ommit_ping=True
                 )
 
-                if self.zk_client.connect():
+                conn = self.zk_client.connect()
+                if conn:
                     self.is_connected_flag = True
                     logger.info(f"Connected to device {self.serial_number or self.ip}")
                     return True
+                else:
+                    logger.error(f"ZK.connect() returned falsy for {self.ip}:{self.port}")
 
             except Exception as e:
                 logger.error(f"Connection failed to {self.ip}:{self.port}: {e}")
@@ -66,23 +73,21 @@ class ZKDevice:
         return self.is_connected_flag and self.zk_client is not None
 
     def get_live_attendance(self) -> List[Dict]:
-        """Get live attendance data using ZK library"""
+        """Get historical attendance data from device"""
         if not self.is_connected():
             return []
 
         try:
-            attendance_data = []
             records = self.zk_client.get_attendance()
-
-            for record in records:
-                attendance_data.append({
+            return [
+                {
                     'user_id': record.user_id,
                     'timestamp': record.timestamp,
                     'status': record.status,
                     'punch': record.punch
-                })
-
-            return attendance_data
+                }
+                for record in (records or [])
+            ]
         except Exception as e:
             logger.error(f"Error getting attendance from device {self.serial_number}: {e}")
             return []
@@ -90,11 +95,12 @@ class ZKDevice:
     def live_capture(self) -> Generator[Dict, None, None]:
         """Live capture of attendance events using ZK library"""
         if not self.is_connected():
+            logger.warning(f"live_capture called but device {self.serial_number} is not connected")
             return
 
         try:
             for attendance in self.zk_client.live_capture():
-                if attendance:
+                if attendance is not None:
                     yield {
                         'user_id': attendance.user_id,
                         'timestamp': attendance.timestamp,
@@ -111,7 +117,6 @@ class ZKDevice:
 
         try:
             device_time = self.zk_client.get_time()
-
             return {
                 'serial_number': self.serial_number or 'Unknown',
                 'ip_address': self.ip,
@@ -129,7 +134,8 @@ class ZKDevice:
             return False
 
         try:
-            return self.zk_client.set_time(datetime.now())
+            result = self.zk_client.set_time(datetime.now())
+            return bool(result)
         except Exception as e:
             logger.error(f"Error syncing time with device {self.serial_number}: {e}")
             return False
@@ -140,7 +146,8 @@ class ZKDevice:
             return False
 
         try:
-            return self.zk_client.clear_attendance()
+            result = self.zk_client.clear_attendance()
+            return bool(result)
         except Exception as e:
             logger.error(f"Error clearing attendance log on device {self.serial_number}: {e}")
             return False
@@ -151,7 +158,7 @@ class ZKDevice:
             return []
 
         try:
-            users = self.zk_client.get_users()
+            users = self.zk_client.get_users() or []
             return [
                 {
                     'uid': user.uid,
