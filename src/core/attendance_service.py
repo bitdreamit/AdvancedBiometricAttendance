@@ -1,127 +1,124 @@
 # src/core/attendance_service.py
+"""
+AttendanceService — thin wrapper that wires DeviceManager → SyncEngine.
+
+Responsibilities:
+  1. Drain the device attendance queue → insert into local DB
+  2. Delegate all server sync to SyncEngine
+"""
 import threading
 import time
 import logging
-import requests
-from typing import List, Dict, Optional
-from datetime import datetime
+from typing import Dict, Optional
 
 try:
     from src.core.database import DatabaseManager
     from src.core.device_manager import DeviceManager
+    from src.core.sync import SyncEngine
 except ImportError:
     from core.database import DatabaseManager
     from core.device_manager import DeviceManager
+    from core.sync import SyncEngine
 
 logger = logging.getLogger(__name__)
 
 
 class AttendanceService:
-    def __init__(self, db_manager: DatabaseManager, device_manager: DeviceManager, config: Dict = None):
-        self.db = db_manager
+
+    def __init__(self, db: DatabaseManager,
+                 device_manager: DeviceManager,
+                 config: Dict = None):
+        self.db             = db
         self.device_manager = device_manager
-        self.config = config or {}
-        self.is_running = False
-        self.sync_thread = None
-        self.sync_interval = int(self.config.get('sync', {}).get('interval_seconds', 300))
+        self.config         = config or {}
+        self.is_running     = False
+        self._thread: Optional[threading.Thread] = None
+        self.sync_engine    = SyncEngine(
+            db      = db,
+            devices = device_manager.devices if device_manager else {},
+            config  = config,
+        )
 
     def start(self, sync_config: Dict = None):
-        """Start the attendance sync service"""
-        if sync_config is None:
-            sync_config = self.config.get('sync', {})
-
         if self.is_running:
             return
+        cfg = sync_config or self.config.get('sync', {})
+        interval = int(cfg.get('interval_seconds', 300))
 
         self.is_running = True
-        self.sync_interval = int(sync_config.get('interval_seconds', 300))
-        self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True, name="AttendanceSync")
-        self.sync_thread.start()
-        logger.info("Attendance service started")
+
+        # Thread: drain device queue → DB every 5 seconds
+        self._thread = threading.Thread(
+            target=self._drain_loop, daemon=True, name="AttendanceService"
+        )
+        self._thread.start()
+
+        # SyncEngine handles server push/pull on its own interval
+        self.sync_engine.start(interval=interval)
+        logger.info("AttendanceService started")
 
     def stop(self):
-        """Stop the attendance sync service"""
         self.is_running = False
-        if self.sync_thread and self.sync_thread.is_alive():
-            self.sync_thread.join(timeout=5.0)
-        logger.info("Attendance service stopped")
+        self.sync_engine.stop()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        logger.info("AttendanceService stopped")
 
-    def _sync_loop(self):
-        """Main sync loop"""
+    def _drain_loop(self):
+        """Drain attendance_queue from DeviceManager into SQLite every 5s."""
         while self.is_running:
             try:
-                self.device_manager.process_attendance_queue()
-                self.sync_attendance()
+                self._drain_queue()
             except Exception as e:
-                logger.error(f"Error in sync loop: {e}", exc_info=True)
-            # Sleep in small increments so stop() responds quickly
-            for _ in range(self.sync_interval):
+                logger.error(f"Drain loop error: {e}")
+            for _ in range(5):
                 if not self.is_running:
-                    break
+                    return
                 time.sleep(1)
 
-    def sync_attendance(self):
-        """Sync pending attendance records to the server"""
-        site_url = self.db.get_config_value('site_url', '')
-        if not site_url or 'example.com' in site_url or site_url == 'enter your Website URL':
-            logger.debug("Site URL not configured or using placeholder — skipping sync")
-            return
-
-        unsynced_records = self.db.get_unsynced_attendance()
-        if not unsynced_records:
-            return
-
-        successful_syncs = []
-        server_config = self.config.get('server', {})
-        verify_ssl = server_config.get('verify_ssl', True)
-        req_timeout = int(server_config.get('timeout', 30))
-        api_key = server_config.get('api_key', '')
-
-        headers = {}
-        if api_key and api_key != 'your_api_key_here':
-            headers['Authorization'] = f'Bearer {api_key}'
-
-        for record in unsynced_records:
+    def _drain_queue(self):
+        """Move all items from in-memory queue to the database."""
+        processed = 0
+        while True:
             try:
-                json_data = {
-                    'uid': record.get('user_id'),
-                    'user_id': record.get('user_id'),
-                    't': record.get('punch_time'),
-                    'ip': record.get('device_ip'),
-                    'serial_number': record.get('device_sn')
-                }
-
-                response = requests.post(
-                    f"{site_url.rstrip('/')}/biometric",
-                    json=json_data,
-                    headers=headers,
-                    timeout=req_timeout,
-                    verify=verify_ssl
+                from queue import Empty
+                record = self.device_manager.attendance_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                ok = self.db.insert_attendance(
+                    zk_user_id  = record['user_id'],
+                    punched_at  = record['punch_time'],
+                    device_sn   = record['device_sn'],
+                    device_ip   = record.get('device_ip'),
+                    verify_type = record.get('verify_type'),
+                    tenant_id   = self.db.get_config('tenant_id') or None,
                 )
-
-                if response.status_code in (200, 201):
-                    successful_syncs.append(record['id'])
-                    logger.info(f"Synced record {record['id']} for user {record.get('user_id')}")
-                else:
-                    logger.warning(f"Server rejected record {record['id']}: HTTP {response.status_code}")
-
-            except requests.Timeout:
-                logger.error(f"Timeout syncing record {record.get('id')}")
-            except requests.ConnectionError:
-                logger.error("Cannot reach server — will retry next cycle")
-                break  # Stop trying if server is unreachable
+                if ok:
+                    processed += 1
+                    logger.info(
+                        f"Recorded: user={record['user_id']} "
+                        f"at={record['punch_time']} device={record['device_sn']}"
+                    )
             except Exception as e:
-                logger.error(f"Error syncing record {record.get('id')}: {e}")
+                logger.error(f"Error inserting attendance: {e}")
+            finally:
+                self.device_manager.attendance_queue.task_done()
 
-        if successful_syncs:
-            self.db.mark_attendance_synced(successful_syncs)
-            logger.info(f"Marked {len(successful_syncs)} records as synced")
+        # Keep SyncEngine device map current
+        if self.device_manager.devices != self.sync_engine.devices:
+            self.sync_engine.update_devices(self.device_manager.devices)
+
+    # Kept for backward compat / direct call from tests
+    def sync_attendance(self):
+        self.sync_engine.sync_now()
 
     def get_sync_status(self) -> Dict:
-        unsynced = self.db.get_unsynced_attendance()
+        stats = self.db.get_attendance_stats()
         return {
-            'unsynced_count': len(unsynced),
-            'sync_interval': self.sync_interval,
+            'pending':    stats.get('pending',   0),
+            'synced':     stats.get('synced',    0),
+            'error':      stats.get('error',     0),
+            'duplicate':  stats.get('duplicate', 0),
             'is_running': self.is_running,
-            'last_check': datetime.now().isoformat()
         }

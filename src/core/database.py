@@ -1,22 +1,52 @@
 # src/core/database.py
 """
-Complete database layer for the Advanced Biometric Attendance System.
+Advanced Biometric Attendance — Offline Agent Database
 
-Tables:
-  devices        — ZKTeco hardware devices
-  employees      — Staff registered in the system
-  biometrics     — Finger/face/card data per employee
-  shifts         — Shift definitions (Morning, Evening, Night, Flexible)
-  employee_shifts— Which employee works which shift
-  attendance     — Raw punch records from devices
-  attendance_log — Processed IN/OUT pairs with calculated hours
-  leave_types    — Leave categories (Annual, Sick, Casual, etc.)
-  leave_requests — Employee leave applications
-  configuration  — App key/value settings
+DESIGN PHILOSOPHY
+─────────────────
+This tool is a DEVICE BRIDGE, not an HR system.
+
+It holds ONLY what it needs to:
+  1. Know which employees exist (to map ZK user_id → employee)
+  2. Know which devices to connect to
+  3. Buffer raw punch events until they are synced online
+  4. Support bidirectional sync with any online system
+
+All HR logic (shifts, leave, overtime, reports, departments)
+lives ONLY in the online system (Laravel, Django, etc.).
+
+TABLES (4 only)
+───────────────
+  devices       — ZKTeco hardware inventory
+  employees     — Minimal employee registry (synced FROM online)
+  attendance    — Raw punch buffer (synced TO online)
+  configuration — Agent settings (server URL, API key, etc.)
+
+TENANT SUPPORT
+──────────────
+  tenant_id on employees and attendance.
+  NULL tenant_id = single-tenant / no multi-tenancy.
+  Non-null = the employee/record belongs to that tenant.
+  The online system assigns tenant_id values.
+
+BIDIRECTIONAL SYNC
+──────────────────
+  Online → Offline : employees table (who is enrolled)
+  Offline → Online : attendance table (punch events)
+
+SYNC COLUMNS (present on both sides)
+─────────────────────────────────────
+  remote_id      — primary key on the online server
+  synced_at      — when this row was last confirmed synced
+  sync_status    — pending | synced | error | conflict
+  checksum       — SHA-256 of key fields for conflict detection
 """
+
 import sqlite3
+import hashlib
+import json
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -24,801 +54,513 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
+
     def __init__(self, db_path: str = "data/att.db", config: Dict = None):
         self.db_path = db_path
         self.config  = config or {}
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_database()
 
-    # ------------------------------------------------------------------ #
-    # Connection                                                           #
-    # ------------------------------------------------------------------ #
+    # ── Connection ────────────────────────────────────────────────────── #
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row          # rows behave like dicts
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
-    # ------------------------------------------------------------------ #
-    # Schema                                                               #
-    # ------------------------------------------------------------------ #
+    # ── Schema ────────────────────────────────────────────────────────── #
 
     def _init_database(self):
         ddl = """
 
-        -- ── Devices ─────────────────────────────────────────────────────
+        -- ── devices ─────────────────────────────────────────────────────
+        -- Who:    managed by this offline agent
+        -- Sync:   agent registers devices; online can read device list
+        -- Online: may mirror this table for dashboard visibility
         CREATE TABLE IF NOT EXISTS devices (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip            TEXT    NOT NULL,
+            tenant_id     TEXT,               -- NULL = no multi-tenancy
+            ip            TEXT NOT NULL,
             port          INTEGER NOT NULL DEFAULT 4370,
-            serial_number TEXT    NOT NULL UNIQUE,
+            serial_number TEXT NOT NULL UNIQUE,
             name          TEXT,
             location      TEXT,
-            last_sync     TIMESTAMP,
             is_active     INTEGER NOT NULL DEFAULT 1,
+            last_seen_at  TIMESTAMP,          -- last successful connection
+            -- sync columns
+            remote_id     TEXT,               -- device ID on online server
+            sync_status   TEXT NOT NULL DEFAULT 'local',
+            --   local     = exists only offline, not yet pushed
+            --   synced    = confirmed on online server
+            --   conflict  = mismatch between local and remote
+            synced_at     TIMESTAMP,
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- ── Departments ──────────────────────────────────────────────────
-        CREATE TABLE IF NOT EXISTS departments (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            name       TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- ── Employees ────────────────────────────────────────────────────
+        -- ── employees ────────────────────────────────────────────────────
+        -- Who:    seeded FROM online system (bidirectional)
+        -- Why:    needed offline to map ZK user_id → employee
+        -- Rule:   online system is master; this is a local mirror
+        -- Sync:   online pushes new/updated employees → agent stores here
+        --         agent reads this to enrich attendance records
         CREATE TABLE IF NOT EXISTS employees (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_code TEXT    NOT NULL UNIQUE,
-            name          TEXT    NOT NULL,
-            email         TEXT,
-            phone         TEXT,
-            department_id INTEGER REFERENCES departments(id) ON DELETE SET NULL,
+            tenant_id     TEXT,               -- NULL = single-tenant mode
+            -- identity (must match online system exactly)
+            remote_id     TEXT,               -- PK on online server (UUID or int)
+            employee_code TEXT NOT NULL,      -- e.g. EMP001 — used in reports
+            name          TEXT NOT NULL,
+            -- ZKTeco device identity
+            -- The ZK device stores users by zk_user_id (integer, 1–65535)
+            -- This is what appears in attendance punch packets
+            zk_user_id    TEXT,               -- ZK device user id
+            card_number   TEXT,               -- RFID card number if used
+            -- minimal context (enough to enrich punch data sent to server)
+            department    TEXT,               -- flat string, not FK
             designation   TEXT,
-            join_date     DATE,
-            status        TEXT    NOT NULL DEFAULT 'active',  -- active | inactive
-            synced_to_server INTEGER NOT NULL DEFAULT 0,
+            -- status
+            status        TEXT NOT NULL DEFAULT 'active', -- active | inactive
+            -- sync columns
+            sync_status   TEXT NOT NULL DEFAULT 'pending',
+            --   pending   = received from server, not yet pushed to device
+            --   synced    = confirmed on device
+            --   conflict  = local device data differs from server
+            --   deleted   = server deleted this employee
+            synced_at     TIMESTAMP,          -- when last synced from server
+            checksum      TEXT,               -- SHA-256 of remote_id+employee_code+name
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(employee_code, tenant_id),
+            UNIQUE(zk_user_id,    tenant_id)
+        );
+
+        -- ── attendance ───────────────────────────────────────────────────
+        -- Who:    written by this offline agent (from ZK device events)
+        -- Why:    buffer of raw punch events until pushed to online server
+        -- Rule:   this is the SOURCE OF TRUTH for punch timestamps
+        -- Sync:   agent pushes rows to online; online processes them
+        CREATE TABLE IF NOT EXISTS attendance (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id     TEXT,               -- copied from employee.tenant_id
+            -- punch identity
+            zk_user_id    TEXT NOT NULL,      -- from ZK packet (device-side id)
+            employee_id   INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            remote_employee_id TEXT,          -- employee.remote_id (for server)
+            employee_code TEXT,               -- denormalised for easy sync
+            -- punch data
+            punched_at    TIMESTAMP NOT NULL, -- exact time from device
+            device_sn     TEXT NOT NULL,      -- which device
+            device_ip     TEXT,
+            punch_type    TEXT,               -- check_in | check_out | NULL (server decides)
+            verify_type   TEXT,               -- fingerprint | face | card | pin | password
+            -- sync columns
+            sync_status   TEXT NOT NULL DEFAULT 'pending',
+            --   pending   = waiting to be pushed to online server
+            --   synced    = confirmed received by online server
+            --   error     = server returned error (see sync_error)
+            --   duplicate = server said it already has this record
+            remote_id     TEXT,               -- PK assigned by online server after sync
+            sync_error    TEXT,               -- last error message if status=error
+            synced_at     TIMESTAMP,          -- when server confirmed receipt
+            retry_count   INTEGER NOT NULL DEFAULT 0,
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- ── Biometric data (finger / face / card per device) ─────────────
-        CREATE TABLE IF NOT EXISTS biometrics (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-            device_sn   TEXT    NOT NULL REFERENCES devices(serial_number) ON DELETE CASCADE,
-            type        TEXT    NOT NULL DEFAULT 'fingerprint',  -- fingerprint | face | card | pin
-            template    BLOB,       -- raw template bytes (fingerprint / face)
-            card_number TEXT,       -- for RFID card
-            pin         TEXT,       -- numeric PIN
-            finger_index INTEGER,   -- 0-9 finger position
-            is_primary  INTEGER NOT NULL DEFAULT 1,
-            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(employee_id, device_sn, type, finger_index)
-        );
-
-        -- ── Shifts ───────────────────────────────────────────────────────
-        CREATE TABLE IF NOT EXISTS shifts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            name            TEXT    NOT NULL UNIQUE,
-            start_time      TEXT    NOT NULL,  -- HH:MM  e.g. '09:00'
-            end_time        TEXT    NOT NULL,  -- HH:MM  e.g. '18:00'
-            grace_late      INTEGER NOT NULL DEFAULT 15,   -- minutes allowed late
-            grace_early_out INTEGER NOT NULL DEFAULT 10,   -- minutes allowed early leave
-            overtime_after  INTEGER NOT NULL DEFAULT 30,   -- minutes before overtime starts
-            is_overnight    INTEGER NOT NULL DEFAULT 0,    -- 1 if shift crosses midnight
-            is_flexible     INTEGER NOT NULL DEFAULT 0,    -- 1 for flexible/work-from-home
-            working_days    TEXT    NOT NULL DEFAULT 'Mon,Tue,Wed,Thu,Fri',
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- ── Employee ↔ Shift assignment ───────────────────────────────────
-        CREATE TABLE IF NOT EXISTS employee_shifts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-            shift_id    INTEGER NOT NULL REFERENCES shifts(id)    ON DELETE CASCADE,
-            effective_from DATE NOT NULL,
-            effective_to   DATE,   -- NULL = currently active
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(employee_id, effective_from)
-        );
-
-        -- ── Raw attendance punches from device ────────────────────────────
-        CREATE TABLE IF NOT EXISTS attendance (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     TEXT    NOT NULL,  -- ZKTeco user_id (device-side)
-            employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
-            punch_time  TIMESTAMP NOT NULL,
-            punch_type  TEXT NOT NULL DEFAULT 'auto',  -- check_in | check_out | auto
-            device_ip   TEXT,
-            device_sn   TEXT,
-            status      TEXT NOT NULL DEFAULT 'pending',  -- pending | synced | error
-            sync_time   TIMESTAMP,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- ── Processed daily attendance (IN/OUT pairs) ────────────────────
-        CREATE TABLE IF NOT EXISTS attendance_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id     INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-            work_date       DATE    NOT NULL,
-            check_in        TIMESTAMP,
-            check_out       TIMESTAMP,
-            working_minutes INTEGER,  -- actual minutes worked
-            late_minutes    INTEGER  NOT NULL DEFAULT 0,
-            early_out_minutes INTEGER NOT NULL DEFAULT 0,
-            overtime_minutes  INTEGER NOT NULL DEFAULT 0,
-            status          TEXT NOT NULL DEFAULT 'present',
-            -- present | absent | half_day | on_leave | holiday | weekend
-            remarks         TEXT,
-            shift_id        INTEGER REFERENCES shifts(id),
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(employee_id, work_date)
-        );
-
-        -- ── Leave types ───────────────────────────────────────────────────
-        CREATE TABLE IF NOT EXISTS leave_types (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            name            TEXT    NOT NULL UNIQUE,  -- Annual, Sick, Casual, ...
-            days_allowed    INTEGER NOT NULL DEFAULT 0,  -- per year (0 = unlimited)
-            is_paid         INTEGER NOT NULL DEFAULT 1,
-            carry_forward   INTEGER NOT NULL DEFAULT 0,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- ── Leave requests ────────────────────────────────────────────────
-        CREATE TABLE IF NOT EXISTS leave_requests (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id  INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
-            leave_type_id INTEGER NOT NULL REFERENCES leave_types(id),
-            from_date    DATE    NOT NULL,
-            to_date      DATE    NOT NULL,
-            days         INTEGER NOT NULL,
-            reason       TEXT,
-            status       TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
-            approved_by  TEXT,  -- name or ID of approver
-            applied_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- ── App configuration ─────────────────────────────────────────────
+        -- ── configuration ────────────────────────────────────────────────
+        -- Agent settings — server URL, API key, sync interval, etc.
         CREATE TABLE IF NOT EXISTS configuration (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- ── Indexes ───────────────────────────────────────────────────────
-        CREATE INDEX IF NOT EXISTS idx_attendance_user     ON attendance(user_id);
-        CREATE INDEX IF NOT EXISTS idx_attendance_time     ON attendance(punch_time);
-        CREATE INDEX IF NOT EXISTS idx_attendance_status   ON attendance(status);
-        CREATE INDEX IF NOT EXISTS idx_att_log_emp_date    ON attendance_log(employee_id, work_date);
-        CREATE INDEX IF NOT EXISTS idx_leave_emp           ON leave_requests(employee_id);
-        CREATE INDEX IF NOT EXISTS idx_emp_dept            ON employees(department_id);
-        CREATE INDEX IF NOT EXISTS idx_biometrics_emp      ON biometrics(employee_id);
+        -- ── Indexes ──────────────────────────────────────────────────────
+        CREATE INDEX IF NOT EXISTS idx_att_zk_user    ON attendance(zk_user_id);
+        CREATE INDEX IF NOT EXISTS idx_att_punched_at ON attendance(punched_at);
+        CREATE INDEX IF NOT EXISTS idx_att_sync       ON attendance(sync_status);
+        CREATE INDEX IF NOT EXISTS idx_att_tenant     ON attendance(tenant_id);
+        CREATE INDEX IF NOT EXISTS idx_emp_remote     ON employees(remote_id);
+        CREATE INDEX IF NOT EXISTS idx_emp_zk_user    ON employees(zk_user_id);
+        CREATE INDEX IF NOT EXISTS idx_emp_code       ON employees(employee_code);
+        CREATE INDEX IF NOT EXISTS idx_emp_tenant     ON employees(tenant_id);
+        CREATE INDEX IF NOT EXISTS idx_emp_card       ON employees(card_number);
+        CREATE INDEX IF NOT EXISTS idx_dev_sn         ON devices(serial_number);
+        CREATE INDEX IF NOT EXISTS idx_dev_tenant     ON devices(tenant_id);
         """
 
         with self._get_connection() as conn:
-            for stmt in ddl.split(';'):
-                stmt = stmt.strip()
-                if stmt:
-                    try:
-                        conn.execute(stmt)
-                    except sqlite3.Error as e:
-                        logger.error(f"DDL error: {e}\nStatement: {stmt[:80]}")
-
+            # Use executescript which handles full SQL including comments
+            try:
+                conn.executescript(ddl)
+            except sqlite3.Error as e:
+                # executescript stops on first error; fall back to statement-by-statement
+                logger.warning(f"executescript failed ({e}), retrying per-statement")
+                import re
+                # Strip single-line comments, then split on semicolons
+                clean = re.sub(r'--[^\n]*', '', ddl)
+                for stmt in clean.split(';'):
+                    s = stmt.strip()
+                    if s and any(kw in s.upper() for kw in ('CREATE','INSERT','DROP','ALTER')):
+                        try:
+                            conn.execute(s)
+                        except sqlite3.Error as e2:
+                            logger.debug(f"DDL stmt error: {e2} | {s[:60]}")
             self._seed_defaults(conn)
             conn.commit()
-        logger.info("Database initialised")
+        logger.info("Database initialised — 4 tables")
 
     def _seed_defaults(self, conn):
-        """Insert default configuration, leave types, and shifts if empty."""
-        # Config defaults
         defaults = {
-            'site_url':       '',
-            'api_key':        '',
-            'sync_interval':  '300',
-            'timezone':       'Asia/Dhaka',
-            'date_format':    'Y-m-d',
-            'time_format':    'H:i',
-            'work_week_start':'Mon',
-            'log_level':      'INFO',
+            'server_url':       '',
+            'api_key':          '',
+            'tenant_id':        '',        # empty = single-tenant
+            'sync_interval':    '300',     # seconds
+            'retry_limit':      '5',       # max retry attempts per record
+            'batch_size':       '100',     # records per HTTP request
+            'verify_ssl':       'true',
+            'timezone':         'Asia/Dhaka',
+            'agent_version':    '2.2',
         }
         for k, v in defaults.items():
             conn.execute(
-                "INSERT OR IGNORE INTO configuration (key, value) VALUES (?, ?)", (k, v)
+                "INSERT OR IGNORE INTO configuration (key, value) VALUES (?, ?)",
+                (k, v)
             )
 
-        # Default leave types
-        leave_types = [
-            ('Annual Leave',   20, 1, 1),
-            ('Sick Leave',     10, 1, 0),
-            ('Casual Leave',    8, 1, 0),
-            ('Unpaid Leave',    0, 0, 0),
-            ('Maternity Leave',90, 1, 0),
-            ('Paternity Leave', 7, 1, 0),
-        ]
-        for name, days, paid, carry in leave_types:
-            conn.execute(
-                "INSERT OR IGNORE INTO leave_types (name, days_allowed, is_paid, carry_forward) "
-                "VALUES (?, ?, ?, ?)", (name, days, paid, carry)
-            )
+    # ── Helpers ───────────────────────────────────────────────────────── #
 
-        # Default shifts
-        shifts = [
-            ('Morning Shift',  '08:00', '16:00', 15, 10, 30, 0, 0, 'Mon,Tue,Wed,Thu,Fri'),
-            ('Day Shift',      '09:00', '17:00', 15, 10, 30, 0, 0, 'Mon,Tue,Wed,Thu,Fri'),
-            ('Evening Shift',  '14:00', '22:00', 15, 10, 30, 0, 0, 'Mon,Tue,Wed,Thu,Fri'),
-            ('Night Shift',    '22:00', '06:00', 15, 10, 30, 1, 0, 'Mon,Tue,Wed,Thu,Fri'),
-            ('Flexible',       '08:00', '20:00',  0,  0, 30, 0, 1, 'Mon,Tue,Wed,Thu,Fri'),
-            ('Half Day AM',    '08:00', '12:00', 10,  5,  0, 0, 0, 'Mon,Tue,Wed,Thu,Fri'),
-        ]
-        for s in shifts:
-            conn.execute(
-                "INSERT OR IGNORE INTO shifts "
-                "(name, start_time, end_time, grace_late, grace_early_out, "
-                " overtime_after, is_overnight, is_flexible, working_days) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", s
-            )
-
-        # Default department
-        conn.execute(
-            "INSERT OR IGNORE INTO departments (name) VALUES (?)", ('General',)
-        )
-
-    # ------------------------------------------------------------------ #
-    # Generic helpers                                                      #
-    # ------------------------------------------------------------------ #
-
-    def execute_query(self, sql: str, params=(), commit: bool = False):
-        try:
-            with self._get_connection() as conn:
-                cur = conn.execute(sql, params)
-                if commit:
-                    conn.commit()
-                return cur
-        except sqlite3.Error as e:
-            logger.error(f"DB error: {e} | SQL: {sql[:80]}")
-            return None
+    def _conn(self):
+        return self._get_connection()
 
     def fetchall(self, sql: str, params=()) -> List[Dict]:
         try:
-            with self._get_connection() as conn:
-                cur = conn.execute(sql, params)
-                return [dict(row) for row in cur.fetchall()]
+            with self._conn() as conn:
+                return [dict(r) for r in conn.execute(sql, params).fetchall()]
         except sqlite3.Error as e:
-            logger.error(f"fetchall error: {e}")
+            logger.error(f"fetchall: {e}")
             return []
 
     def fetchone(self, sql: str, params=()) -> Optional[Dict]:
         try:
-            with self._get_connection() as conn:
-                cur = conn.execute(sql, params)
-                row = cur.fetchone()
-                return dict(row) if row else None
+            with self._conn() as conn:
+                r = conn.execute(sql, params).fetchone()
+                return dict(r) if r else None
         except sqlite3.Error as e:
-            logger.error(f"fetchone error: {e}")
+            logger.error(f"fetchone: {e}")
             return None
 
-    # ------------------------------------------------------------------ #
-    # Configuration                                                        #
-    # ------------------------------------------------------------------ #
-
-    def get_config_value(self, key: str, default: Any = None) -> Any:
-        row = self.fetchone("SELECT value FROM configuration WHERE key = ?", (key,))
-        return row['value'] if row else default
-
-    def set_config_value(self, key: str, value: Any) -> bool:
-        cur = self.execute_query(
-            "INSERT OR REPLACE INTO configuration (key, value, updated_at) "
-            "VALUES (?, ?, CURRENT_TIMESTAMP)",
-            (key, str(value)), commit=True
-        )
-        return cur is not None
-
-    # ------------------------------------------------------------------ #
-    # Devices                                                              #
-    # ------------------------------------------------------------------ #
-
-    def get_devices(self) -> List[Dict]:
-        return self.fetchall(
-            "SELECT * FROM devices WHERE is_active = 1 ORDER BY name"
-        )
-
-    def add_device(self, ip: str, port: int, serial_number: str,
-                   name: str = None, location: str = None) -> bool:
-        cur = self.execute_query(
-            "INSERT OR REPLACE INTO devices (ip, port, serial_number, name, location) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (ip, port, serial_number, name, location), commit=True
-        )
-        return cur is not None
-
-    def delete_device(self, serial_number: str) -> bool:
-        cur = self.execute_query(
-            "UPDATE devices SET is_active = 0 WHERE serial_number = ?",
-            (serial_number,), commit=True
-        )
-        return cur is not None
-
-    # ------------------------------------------------------------------ #
-    # Departments                                                          #
-    # ------------------------------------------------------------------ #
-
-    def get_departments(self) -> List[Dict]:
-        return self.fetchall("SELECT * FROM departments ORDER BY name")
-
-    def add_department(self, name: str) -> Optional[int]:
+    def execute(self, sql: str, params=(), commit: bool = True) -> bool:
         try:
-            with self._get_connection() as conn:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO departments (name) VALUES (?)", (name,)
-                )
-                conn.commit()
-                return cur.lastrowid
+            with self._conn() as conn:
+                conn.execute(sql, params)
+                if commit:
+                    conn.commit()
+            return True
         except sqlite3.Error as e:
-            logger.error(f"add_department: {e}")
-            return None
-
-    # ------------------------------------------------------------------ #
-    # Employees                                                            #
-    # ------------------------------------------------------------------ #
-
-    def add_employee(self, employee_code: str, name: str,
-                     department_id: int = None, designation: str = None,
-                     email: str = None, phone: str = None,
-                     join_date: str = None) -> Optional[int]:
-        """Register a new employee. Returns employee id or None."""
-        try:
-            with self._get_connection() as conn:
-                cur = conn.execute(
-                    """INSERT INTO employees
-                       (employee_code, name, email, phone, department_id,
-                        designation, join_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (employee_code, name, email, phone, department_id,
-                     designation, join_date or date.today().isoformat())
-                )
-                conn.commit()
-                logger.info(f"Employee registered: {name} ({employee_code})")
-                return cur.lastrowid
-        except sqlite3.IntegrityError:
-            logger.warning(f"Employee code already exists: {employee_code}")
-            return None
-        except sqlite3.Error as e:
-            logger.error(f"add_employee: {e}")
-            return None
-
-    def get_employees(self, active_only: bool = True) -> List[Dict]:
-        sql = """
-            SELECT e.*, d.name as department_name
-            FROM employees e
-            LEFT JOIN departments d ON e.department_id = d.id
-        """
-        if active_only:
-            sql += " WHERE e.status = 'active'"
-        sql += " ORDER BY e.name"
-        return self.fetchall(sql)
-
-    def get_employee(self, employee_id: int = None,
-                     employee_code: str = None) -> Optional[Dict]:
-        if employee_id:
-            sql    = "SELECT e.*, d.name as department_name FROM employees e LEFT JOIN departments d ON e.department_id = d.id WHERE e.id = ?"
-            params = (employee_id,)
-        elif employee_code:
-            sql    = "SELECT e.*, d.name as department_name FROM employees e LEFT JOIN departments d ON e.department_id = d.id WHERE e.employee_code = ?"
-            params = (employee_code,)
-        else:
-            return None
-        return self.fetchone(sql, params)
-
-    def update_employee(self, employee_id: int, **fields) -> bool:
-        allowed = {'name', 'email', 'phone', 'department_id',
-                   'designation', 'status', 'join_date'}
-        updates = {k: v for k, v in fields.items() if k in allowed}
-        if not updates:
+            logger.error(f"execute: {e} | {sql[:60]}")
             return False
-        set_clause = ', '.join(f"{k} = ?" for k in updates)
-        values     = list(updates.values()) + [employee_id]
-        cur = self.execute_query(
-            f"UPDATE employees SET {set_clause} WHERE id = ?",
-            values, commit=True
+
+    @staticmethod
+    def _checksum(*parts) -> str:
+        raw = '|'.join(str(p or '') for p in parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    # ── Configuration ─────────────────────────────────────────────────── #
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        r = self.fetchone("SELECT value FROM configuration WHERE key=?", (key,))
+        return r['value'] if r else default
+
+    def set_config(self, key: str, value: Any) -> bool:
+        return self.execute(
+            "INSERT OR REPLACE INTO configuration (key,value,updated_at) "
+            "VALUES (?,?,CURRENT_TIMESTAMP)",
+            (key, str(value))
         )
-        return cur is not None
 
-    def get_employee_by_zk_user_id(self, user_id: str) -> Optional[Dict]:
-        """Map a ZKTeco user_id → employee record."""
-        return self.fetchone(
-            """SELECT e.* FROM employees e
-               JOIN biometrics b ON b.employee_id = e.id
-               WHERE b.card_number = ? OR CAST(e.id AS TEXT) = ?
-               LIMIT 1""",
-            (str(user_id), str(user_id))
+    def get_all_config(self) -> Dict:
+        rows = self.fetchall("SELECT key, value FROM configuration")
+        return {r['key']: r['value'] for r in rows}
+
+    # ── Devices ───────────────────────────────────────────────────────── #
+
+    def upsert_device(self, ip: str, port: int, serial_number: str,
+                      name: str = None, location: str = None,
+                      tenant_id: str = None, remote_id: str = None) -> bool:
+        return self.execute(
+            """INSERT INTO devices (ip, port, serial_number, name, location,
+                                   tenant_id, remote_id)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(serial_number) DO UPDATE SET
+                 ip=excluded.ip, port=excluded.port, name=excluded.name,
+                 location=excluded.location, remote_id=excluded.remote_id,
+                 last_seen_at=CURRENT_TIMESTAMP""",
+            (ip, port, serial_number, name, location, tenant_id, remote_id)
         )
 
-    # ------------------------------------------------------------------ #
-    # Biometrics                                                           #
-    # ------------------------------------------------------------------ #
+    # backwards compat alias
+    def add_device(self, ip, port, serial_number, name=None, location=None):
+        return self.upsert_device(ip, port, serial_number, name, location)
 
-    def register_biometric(self, employee_id: int, device_sn: str,
-                            bio_type: str = 'fingerprint',
-                            template: bytes = None,
-                            card_number: str = None,
-                            pin: str = None,
-                            finger_index: int = 0) -> bool:
-        """Store finger/face/card/PIN data for an employee on a device."""
-        cur = self.execute_query(
-            """INSERT OR REPLACE INTO biometrics
-               (employee_id, device_sn, type, template, card_number, pin, finger_index)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (employee_id, device_sn, bio_type, template,
-             card_number, pin, finger_index),
-            commit=True
-        )
-        if cur:
-            logger.info(f"Biometric ({bio_type}) registered for employee {employee_id} on {device_sn}")
-        return cur is not None
-
-    def get_employee_biometrics(self, employee_id: int) -> List[Dict]:
+    def get_devices(self, tenant_id: str = None) -> List[Dict]:
+        if tenant_id:
+            return self.fetchall(
+                "SELECT * FROM devices WHERE is_active=1 AND tenant_id=? ORDER BY name",
+                (tenant_id,)
+            )
         return self.fetchall(
-            "SELECT * FROM biometrics WHERE employee_id = ? ORDER BY type, finger_index",
+            "SELECT * FROM devices WHERE is_active=1 ORDER BY name"
+        )
+
+    def touch_device(self, serial_number: str) -> bool:
+        return self.execute(
+            "UPDATE devices SET last_seen_at=CURRENT_TIMESTAMP WHERE serial_number=?",
+            (serial_number,)
+        )
+
+    def mark_device_synced(self, serial_number: str, remote_id: str) -> bool:
+        return self.execute(
+            "UPDATE devices SET remote_id=?, sync_status='synced', synced_at=CURRENT_TIMESTAMP "
+            "WHERE serial_number=?",
+            (remote_id, serial_number)
+        )
+
+    # ── Employees ─────────────────────────────────────────────────────── #
+
+    def upsert_employee(self, employee_code: str, name: str,
+                        remote_id: str = None,
+                        zk_user_id: str = None,
+                        card_number: str = None,
+                        department: str = None,
+                        designation: str = None,
+                        status: str = 'active',
+                        tenant_id: str = None) -> Optional[int]:
+        """
+        Insert or update an employee record.
+        Called when the online server pushes employee data to this agent.
+        Returns local id.
+        """
+        checksum = self._checksum(remote_id, employee_code, name, tenant_id)
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO employees
+                       (tenant_id, remote_id, employee_code, name,
+                        zk_user_id, card_number, department, designation,
+                        status, checksum, sync_status, synced_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,'synced',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                       ON CONFLICT(employee_code, tenant_id) DO UPDATE SET
+                         remote_id     = excluded.remote_id,
+                         name          = excluded.name,
+                         zk_user_id    = excluded.zk_user_id,
+                         card_number   = excluded.card_number,
+                         department    = excluded.department,
+                         designation   = excluded.designation,
+                         status        = excluded.status,
+                         checksum      = excluded.checksum,
+                         sync_status   = 'synced',
+                         synced_at     = CURRENT_TIMESTAMP,
+                         updated_at    = CURRENT_TIMESTAMP""",
+                    (tenant_id, remote_id, employee_code, name,
+                     str(zk_user_id) if zk_user_id else None,
+                     card_number, department, designation, status, checksum)
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT id FROM employees WHERE employee_code=? AND (tenant_id=? OR (tenant_id IS NULL AND ? IS NULL))",
+                    (employee_code, tenant_id, tenant_id)
+                ).fetchone()
+                return row['id'] if row else None
+        except sqlite3.Error as e:
+            logger.error(f"upsert_employee: {e}")
+            return None
+
+    def get_employee_by_zk_id(self, zk_user_id: str,
+                               tenant_id: str = None) -> Optional[Dict]:
+        """Resolve a ZK punch user_id to an employee record."""
+        if tenant_id:
+            return self.fetchone(
+                "SELECT * FROM employees WHERE zk_user_id=? AND tenant_id=? AND status='active'",
+                (str(zk_user_id), tenant_id)
+            )
+        return self.fetchone(
+            "SELECT * FROM employees WHERE zk_user_id=? AND status='active'",
+            (str(zk_user_id),)
+        )
+
+    def get_employee_by_card(self, card_number: str,
+                              tenant_id: str = None) -> Optional[Dict]:
+        if tenant_id:
+            return self.fetchone(
+                "SELECT * FROM employees WHERE card_number=? AND tenant_id=? AND status='active'",
+                (card_number, tenant_id)
+            )
+        return self.fetchone(
+            "SELECT * FROM employees WHERE card_number=? AND status='active'",
+            (card_number,)
+        )
+
+    def get_employees(self, tenant_id: str = None,
+                      active_only: bool = True) -> List[Dict]:
+        sql    = "SELECT * FROM employees WHERE 1=1"
+        params = []
+        if active_only:
+            sql += " AND status='active'"
+        if tenant_id:
+            sql += " AND tenant_id=?"
+            params.append(tenant_id)
+        sql += " ORDER BY name"
+        return self.fetchall(sql, params)
+
+    def mark_employee_deleted(self, remote_id: str,
+                               tenant_id: str = None) -> bool:
+        """Soft-delete when online server removes an employee."""
+        if tenant_id:
+            return self.execute(
+                "UPDATE employees SET status='inactive', sync_status='deleted', "
+                "updated_at=CURRENT_TIMESTAMP WHERE remote_id=? AND tenant_id=?",
+                (remote_id, tenant_id)
+            )
+        return self.execute(
+            "UPDATE employees SET status='inactive', sync_status='deleted', "
+            "updated_at=CURRENT_TIMESTAMP WHERE remote_id=?",
+            (remote_id,)
+        )
+
+    def get_employees_pending_device_push(self,
+                                          tenant_id: str = None) -> List[Dict]:
+        """Employees synced from server but not yet pushed to ZK device."""
+        sql    = "SELECT * FROM employees WHERE sync_status='pending'"
+        params = []
+        if tenant_id:
+            sql += " AND tenant_id=?"
+            params.append(tenant_id)
+        return self.fetchall(sql, params)
+
+    def mark_employee_pushed(self, employee_id: int) -> bool:
+        """Mark employee as successfully pushed to ZK device."""
+        return self.execute(
+            "UPDATE employees SET sync_status='synced', synced_at=CURRENT_TIMESTAMP WHERE id=?",
             (employee_id,)
         )
 
-    def delete_biometric(self, employee_id: int, device_sn: str,
-                          bio_type: str = None) -> bool:
-        if bio_type:
-            cur = self.execute_query(
-                "DELETE FROM biometrics WHERE employee_id=? AND device_sn=? AND type=?",
-                (employee_id, device_sn, bio_type), commit=True
-            )
-        else:
-            cur = self.execute_query(
-                "DELETE FROM biometrics WHERE employee_id=? AND device_sn=?",
-                (employee_id, device_sn), commit=True
-            )
-        return cur is not None
+    # ── Attendance ────────────────────────────────────────────────────── #
 
-    # ------------------------------------------------------------------ #
-    # Shifts                                                               #
-    # ------------------------------------------------------------------ #
-
-    def get_shifts(self) -> List[Dict]:
-        return self.fetchall("SELECT * FROM shifts ORDER BY start_time")
-
-    def get_shift(self, shift_id: int) -> Optional[Dict]:
-        return self.fetchone("SELECT * FROM shifts WHERE id = ?", (shift_id,))
-
-    def add_shift(self, name: str, start_time: str, end_time: str,
-                  grace_late: int = 15, grace_early_out: int = 10,
-                  overtime_after: int = 30, is_overnight: int = 0,
-                  is_flexible: int = 0,
-                  working_days: str = 'Mon,Tue,Wed,Thu,Fri') -> Optional[int]:
-        """Create a new shift definition."""
-        try:
-            with self._get_connection() as conn:
-                cur = conn.execute(
-                    """INSERT INTO shifts
-                       (name, start_time, end_time, grace_late, grace_early_out,
-                        overtime_after, is_overnight, is_flexible, working_days)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (name, start_time, end_time, grace_late, grace_early_out,
-                     overtime_after, is_overnight, is_flexible, working_days)
-                )
-                conn.commit()
-                logger.info(f"Shift created: {name} ({start_time}-{end_time})")
-                return cur.lastrowid
-        except sqlite3.Error as e:
-            logger.error(f"add_shift: {e}")
-            return None
-
-    def assign_shift(self, employee_id: int, shift_id: int,
-                     effective_from: str = None,
-                     effective_to: str = None) -> bool:
-        """Assign a shift to an employee from a given date."""
-        if not effective_from:
-            effective_from = date.today().isoformat()
-        try:
-            with self._get_connection() as conn:
-                # Close any open assignment
-                conn.execute(
-                    """UPDATE employee_shifts
-                       SET effective_to = ?
-                       WHERE employee_id = ? AND effective_to IS NULL""",
-                    (effective_from, employee_id)
-                )
-                conn.execute(
-                    """INSERT INTO employee_shifts
-                       (employee_id, shift_id, effective_from, effective_to)
-                       VALUES (?, ?, ?, ?)""",
-                    (employee_id, shift_id, effective_from, effective_to)
-                )
-                conn.commit()
-                logger.info(f"Shift {shift_id} assigned to employee {employee_id} from {effective_from}")
-                return True
-        except sqlite3.Error as e:
-            logger.error(f"assign_shift: {e}")
+    def insert_attendance(self, zk_user_id: str, punched_at: str,
+                           device_sn: str, device_ip: str = None,
+                           verify_type: str = None,
+                           tenant_id: str = None) -> bool:
+        """
+        Record a raw punch event from a ZK device.
+        Enriches with employee data if available.
+        Skips true duplicates (same user + same second on same device).
+        """
+        # Duplicate guard — exact same second on same device
+        existing = self.fetchone(
+            """SELECT id FROM attendance
+               WHERE zk_user_id=? AND device_sn=?
+                 AND ABS(strftime('%s',punched_at)-strftime('%s',?)) < 2""",
+            (str(zk_user_id), device_sn, punched_at)
+        )
+        if existing:
+            logger.debug(f"Duplicate punch skipped: user={zk_user_id} at={punched_at}")
             return False
 
-    def get_employee_shift(self, employee_id: int,
-                            on_date: str = None) -> Optional[Dict]:
-        """Get the active shift for an employee on a given date."""
-        if not on_date:
-            on_date = date.today().isoformat()
-        return self.fetchone(
-            """SELECT s.* FROM shifts s
-               JOIN employee_shifts es ON es.shift_id = s.id
-               WHERE es.employee_id = ?
-                 AND es.effective_from <= ?
-                 AND (es.effective_to IS NULL OR es.effective_to >= ?)
-               ORDER BY es.effective_from DESC
-               LIMIT 1""",
-            (employee_id, on_date, on_date)
-        )
+        # Resolve employee
+        emp = self.get_employee_by_zk_id(str(zk_user_id), tenant_id)
+        emp_id         = emp['id']            if emp else None
+        remote_emp_id  = emp['remote_id']     if emp else None
+        employee_code  = emp['employee_code'] if emp else None
+        resolved_tenant= emp['tenant_id']     if emp else tenant_id
 
-    # ------------------------------------------------------------------ #
-    # Attendance — raw punches                                             #
-    # ------------------------------------------------------------------ #
-
-    def insert_attendance(self, user_id, punch_time: str,
-                           device_ip: str, device_sn: str,
-                           punch_type: str = 'auto') -> bool:
-        # Try to resolve employee_id from user_id
-        emp = self.fetchone(
-            "SELECT id FROM employees WHERE id = ? OR employee_code = ?",
-            (str(user_id), str(user_id))
-        )
-        emp_id = emp['id'] if emp else None
-
-        cur = self.execute_query(
+        return self.execute(
             """INSERT INTO attendance
-               (user_id, employee_id, punch_time, punch_type, device_ip, device_sn)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (str(user_id), emp_id, punch_time, punch_type, device_ip, device_sn),
-            commit=True
-        )
-        return cur is not None
-
-    def get_unsynced_attendance(self, limit: int = 100) -> List[Dict]:
-        return self.fetchall(
-            """SELECT a.*, e.name as employee_name, e.employee_code
-               FROM attendance a
-               LEFT JOIN employees e ON e.id = a.employee_id
-               WHERE a.status = 'pending'
-               ORDER BY a.punch_time
-               LIMIT ?""",
-            (limit,)
+               (tenant_id, zk_user_id, employee_id, remote_employee_id,
+                employee_code, punched_at, device_sn, device_ip, verify_type)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (resolved_tenant, str(zk_user_id), emp_id, remote_emp_id,
+             employee_code, punched_at, device_sn, device_ip, verify_type)
         )
 
-    def mark_attendance_synced(self, ids: List[int]) -> bool:
+    def get_pending_attendance(self, limit: int = 100,
+                                tenant_id: str = None) -> List[Dict]:
+        """Records waiting to be pushed to the online server."""
+        sql    = "SELECT * FROM attendance WHERE sync_status='pending' ORDER BY punched_at LIMIT ?"
+        params = [limit]
+        if tenant_id:
+            sql = ("SELECT * FROM attendance WHERE sync_status='pending' "
+                   "AND tenant_id=? ORDER BY punched_at LIMIT ?")
+            params = [tenant_id, limit]
+        return self.fetchall(sql, params)
+
+    def get_failed_attendance(self, max_retries: int = 5,
+                               tenant_id: str = None) -> List[Dict]:
+        """Records that errored but have retries remaining."""
+        sql    = ("SELECT * FROM attendance WHERE sync_status='error' "
+                  "AND retry_count < ? ORDER BY punched_at LIMIT 100")
+        params = [max_retries]
+        if tenant_id:
+            sql = ("SELECT * FROM attendance WHERE sync_status='error' "
+                   "AND retry_count < ? AND tenant_id=? ORDER BY punched_at LIMIT 100")
+            params = [max_retries, tenant_id]
+        return self.fetchall(sql, params)
+
+    def mark_attendance_synced(self, ids: List[int],
+                                remote_ids: Dict[int, str] = None) -> bool:
+        """Mark records as successfully received by the online server."""
         if not ids:
             return True
-        ph  = ','.join('?' * len(ids))
-        cur = self.execute_query(
-            f"UPDATE attendance SET status='synced', sync_time=CURRENT_TIMESTAMP WHERE id IN ({ph})",
-            ids, commit=True
-        )
-        return cur is not None
-
-    def get_attendance_by_date(self, work_date: str,
-                                employee_id: int = None) -> List[Dict]:
-        sql    = """
-            SELECT a.*, e.name as employee_name, e.employee_code
-            FROM attendance a
-            LEFT JOIN employees e ON e.id = a.employee_id
-            WHERE DATE(a.punch_time) = ?
-        """
-        params = [work_date]
-        if employee_id:
-            sql += " AND a.employee_id = ?"
-            params.append(employee_id)
-        sql += " ORDER BY a.punch_time"
-        return self.fetchall(sql, params)
-
-    # ------------------------------------------------------------------ #
-    # Attendance log — processed IN/OUT                                   #
-    # ------------------------------------------------------------------ #
-
-    def upsert_attendance_log(self, employee_id: int, work_date: str,
-                               check_in: str = None, check_out: str = None,
-                               working_minutes: int = None,
-                               late_minutes: int = 0,
-                               early_out_minutes: int = 0,
-                               overtime_minutes: int = 0,
-                               status: str = 'present',
-                               shift_id: int = None,
-                               remarks: str = None) -> bool:
-        cur = self.execute_query(
-            """INSERT INTO attendance_log
-               (employee_id, work_date, check_in, check_out, working_minutes,
-                late_minutes, early_out_minutes, overtime_minutes, status,
-                shift_id, remarks)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(employee_id, work_date) DO UPDATE SET
-                 check_in        = excluded.check_in,
-                 check_out       = excluded.check_out,
-                 working_minutes = excluded.working_minutes,
-                 late_minutes    = excluded.late_minutes,
-                 early_out_minutes = excluded.early_out_minutes,
-                 overtime_minutes = excluded.overtime_minutes,
-                 status          = excluded.status,
-                 shift_id        = excluded.shift_id,
-                 remarks         = excluded.remarks""",
-            (employee_id, work_date, check_in, check_out, working_minutes,
-             late_minutes, early_out_minutes, overtime_minutes, status,
-             shift_id, remarks),
-            commit=True
-        )
-        return cur is not None
-
-    def get_attendance_log(self, employee_id: int = None,
-                            from_date: str = None,
-                            to_date: str = None) -> List[Dict]:
-        sql = """
-            SELECT al.*, e.name as employee_name, e.employee_code,
-                   s.name as shift_name
-            FROM attendance_log al
-            LEFT JOIN employees e ON e.id = al.employee_id
-            LEFT JOIN shifts s    ON s.id = al.shift_id
-            WHERE 1=1
-        """
-        params = []
-        if employee_id:
-            sql += " AND al.employee_id = ?"
-            params.append(employee_id)
-        if from_date:
-            sql += " AND al.work_date >= ?"
-            params.append(from_date)
-        if to_date:
-            sql += " AND al.work_date <= ?"
-            params.append(to_date)
-        sql += " ORDER BY al.work_date DESC, e.name"
-        return self.fetchall(sql, params)
-
-    def get_attendance_summary(self, employee_id: int,
-                                year: int, month: int) -> Dict:
-        """Monthly summary: present/absent/late/overtime counts."""
-        from_date = f"{year}-{month:02d}-01"
-        to_date   = f"{year}-{month:02d}-31"
-        rows = self.get_attendance_log(employee_id, from_date, to_date)
-        summary = {
-            'present': 0, 'absent': 0, 'late': 0, 'half_day': 0,
-            'on_leave': 0, 'total_working_minutes': 0,
-            'total_overtime_minutes': 0, 'total_late_minutes': 0,
-        }
-        for r in rows:
-            s = r.get('status', '')
-            if s == 'present':        summary['present']  += 1
-            elif s == 'absent':       summary['absent']   += 1
-            elif s == 'half_day':     summary['half_day'] += 1
-            elif s == 'on_leave':     summary['on_leave'] += 1
-            if r.get('late_minutes', 0) > 0:
-                summary['late'] += 1
-            summary['total_working_minutes']  += r.get('working_minutes', 0) or 0
-            summary['total_overtime_minutes'] += r.get('overtime_minutes', 0) or 0
-            summary['total_late_minutes']     += r.get('late_minutes', 0) or 0
-        return summary
-
-    # ------------------------------------------------------------------ #
-    # Leave                                                                #
-    # ------------------------------------------------------------------ #
-
-    def get_leave_types(self) -> List[Dict]:
-        return self.fetchall("SELECT * FROM leave_types ORDER BY name")
-
-    def apply_leave(self, employee_id: int, leave_type_id: int,
-                    from_date: str, to_date: str,
-                    reason: str = None) -> Optional[int]:
-        from_d = datetime.strptime(from_date, '%Y-%m-%d').date()
-        to_d   = datetime.strptime(to_date,   '%Y-%m-%d').date()
-        days   = (to_d - from_d).days + 1
+        remote_ids = remote_ids or {}
         try:
-            with self._get_connection() as conn:
-                cur = conn.execute(
-                    """INSERT INTO leave_requests
-                       (employee_id, leave_type_id, from_date, to_date, days, reason)
-                       VALUES (?,?,?,?,?,?)""",
-                    (employee_id, leave_type_id, from_date, to_date, days, reason)
-                )
+            with self._conn() as conn:
+                for rid in ids:
+                    conn.execute(
+                        """UPDATE attendance SET
+                             sync_status = 'synced',
+                             remote_id   = ?,
+                             synced_at   = CURRENT_TIMESTAMP,
+                             sync_error  = NULL
+                           WHERE id = ?""",
+                        (remote_ids.get(rid), rid)
+                    )
                 conn.commit()
-                logger.info(f"Leave applied: employee {employee_id} {from_date}→{to_date}")
-                return cur.lastrowid
+            return True
         except sqlite3.Error as e:
-            logger.error(f"apply_leave: {e}")
-            return None
+            logger.error(f"mark_attendance_synced: {e}")
+            return False
 
-    def approve_leave(self, leave_id: int, approved_by: str = 'Admin') -> bool:
-        cur = self.execute_query(
-            """UPDATE leave_requests
-               SET status='approved', approved_by=?, updated_at=CURRENT_TIMESTAMP
-               WHERE id=?""",
-            (approved_by, leave_id), commit=True
+    def mark_attendance_error(self, ids: List[int], error: str) -> bool:
+        if not ids:
+            return True
+        ph = ','.join('?' * len(ids))
+        return self.execute(
+            f"UPDATE attendance SET sync_status='error', sync_error=?, "
+            f"retry_count=retry_count+1 WHERE id IN ({ph})",
+            [error] + ids
         )
-        return cur is not None
 
-    def reject_leave(self, leave_id: int, approved_by: str = 'Admin') -> bool:
-        cur = self.execute_query(
-            """UPDATE leave_requests
-               SET status='rejected', approved_by=?, updated_at=CURRENT_TIMESTAMP
-               WHERE id=?""",
-            (approved_by, leave_id), commit=True
+    def mark_attendance_duplicate(self, ids: List[int]) -> bool:
+        if not ids:
+            return True
+        ph = ','.join('?' * len(ids))
+        return self.execute(
+            f"UPDATE attendance SET sync_status='duplicate' WHERE id IN ({ph})", ids
         )
-        return cur is not None
 
-    def get_leave_requests(self, employee_id: int = None,
-                            status: str = None) -> List[Dict]:
-        sql = """
-            SELECT lr.*, e.name as employee_name, e.employee_code,
-                   lt.name as leave_type_name, lt.is_paid
-            FROM leave_requests lr
-            JOIN employees   e  ON e.id  = lr.employee_id
-            JOIN leave_types lt ON lt.id = lr.leave_type_id
-            WHERE 1=1
-        """
+    def get_attendance_stats(self, tenant_id: str = None) -> Dict:
+        sql    = "SELECT sync_status, COUNT(*) as cnt FROM attendance"
         params = []
-        if employee_id:
-            sql += " AND lr.employee_id = ?"
-            params.append(employee_id)
-        if status:
-            sql += " AND lr.status = ?"
-            params.append(status)
-        sql += " ORDER BY lr.applied_at DESC"
-        return self.fetchall(sql, params)
+        if tenant_id:
+            sql += " WHERE tenant_id=?"
+            params.append(tenant_id)
+        sql += " GROUP BY sync_status"
+        rows = self.fetchall(sql, params)
+        return {r['sync_status']: r['cnt'] for r in rows}
 
-    def get_leave_balance(self, employee_id: int, year: int) -> List[Dict]:
-        """How many days of each leave type an employee has used this year."""
-        return self.fetchall(
-            """SELECT lt.name, lt.days_allowed, lt.is_paid,
-                      COALESCE(SUM(CASE WHEN lr.status='approved' THEN lr.days ELSE 0 END), 0) as used,
-                      lt.days_allowed - COALESCE(SUM(CASE WHEN lr.status='approved' THEN lr.days ELSE 0 END), 0) as remaining
-               FROM leave_types lt
-               LEFT JOIN leave_requests lr
-                      ON lr.leave_type_id = lt.id
-                     AND lr.employee_id   = ?
-                     AND strftime('%Y', lr.from_date) = ?
-               GROUP BY lt.id
-               ORDER BY lt.name""",
-            (employee_id, str(year))
-        )
+    # ── Sync helpers ──────────────────────────────────────────────────── #
 
-    # ------------------------------------------------------------------ #
-    # Reports                                                              #
-    # ------------------------------------------------------------------ #
-
-    def get_daily_report(self, work_date: str) -> List[Dict]:
-        return self.fetchall(
-            """SELECT e.employee_code, e.name, d.name as department,
-                      s.name as shift,
-                      al.check_in, al.check_out, al.working_minutes,
-                      al.late_minutes, al.overtime_minutes, al.status
-               FROM employees e
-               LEFT JOIN attendance_log al ON al.employee_id = e.id AND al.work_date = ?
-               LEFT JOIN departments d     ON d.id = e.department_id
-               LEFT JOIN shifts s          ON s.id = al.shift_id
-               WHERE e.status = 'active'
-               ORDER BY d.name, e.name""",
-            (work_date,)
-        )
-
-    def get_monthly_report(self, year: int, month: int) -> List[Dict]:
-        from_date = f"{year}-{month:02d}-01"
-        to_date   = f"{year}-{month:02d}-31"
-        return self.fetchall(
-            """SELECT e.employee_code, e.name, d.name as department,
-                      COUNT(CASE WHEN al.status='present'  THEN 1 END) as present_days,
-                      COUNT(CASE WHEN al.status='absent'   THEN 1 END) as absent_days,
-                      COUNT(CASE WHEN al.status='on_leave' THEN 1 END) as leave_days,
-                      COUNT(CASE WHEN al.late_minutes > 0  THEN 1 END) as late_days,
-                      COALESCE(SUM(al.working_minutes),  0) as total_minutes,
-                      COALESCE(SUM(al.overtime_minutes), 0) as overtime_minutes,
-                      COALESCE(SUM(al.late_minutes),     0) as late_minutes
-               FROM employees e
-               LEFT JOIN attendance_log al ON al.employee_id = e.id
-                                          AND al.work_date BETWEEN ? AND ?
-               LEFT JOIN departments d ON d.id = e.department_id
-               WHERE e.status = 'active'
-               GROUP BY e.id
-               ORDER BY d.name, e.name""",
-            (from_date, to_date)
-        )
+    def get_unsynced_attendance(self, limit: int = 100) -> List[Dict]:
+        """Alias kept for backwards compatibility."""
+        return self.get_pending_attendance(limit)
