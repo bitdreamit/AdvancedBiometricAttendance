@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 import sys
 from datetime import datetime
-from socket import AF_INET, SOCK_DGRAM, SOCK_STREAM, socket, timeout
+from socket import AF_INET, SOCK_DGRAM, SOCK_STREAM, socket, timeout as sock_timeout
 from struct import pack, unpack
-import codecs
 import logging
 from typing import List, Optional, Generator
 
@@ -16,18 +15,7 @@ from .finger import Finger
 logger = logging.getLogger(__name__)
 
 
-def safe_cast(val, to_type, default=None):
-    try:
-        return to_type(val)
-    except (ValueError, TypeError):
-        return default
-
-
 def make_commkey(key, session_id, ticks=50):
-    """
-    Take a password and session_id and scramble them to send to the machine.
-    Copied from commpro.c - MakeKey
-    """
     key = int(key)
     session_id = int(session_id)
     k = 0
@@ -48,70 +36,37 @@ def make_commkey(key, session_id, ticks=50):
     return k
 
 
-class ZK_helper(object):
-    def __init__(self, ip, port=4370):
-        self.address = (ip, port)
-        self.ip = ip
-        self.port = port
+class ZK:
+    """ZKTeco device low-level protocol driver (TCP + UDP)."""
 
-    def test_ping(self):
-        import subprocess
-        import platform
-        ping_str = '-n 1' if platform.system().lower() == 'windows' else '-c 1 -W 5'
-        args = 'ping ' + ping_str + ' ' + self.ip
-        need_sh = False if platform.system().lower() == 'windows' else True
-        try:
-            return subprocess.call(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=need_sh) == 0
-        except Exception:
-            return False
+    def __init__(self, ip, port=4370, timeout=60, password=0,
+                 force_udp=False, ommit_ping=False, encoding='UTF-8'):
+        self.ip          = ip
+        self.port        = port
+        self.address     = (ip, port)
+        self.timeout     = timeout
+        self.password    = password
+        self.force_udp   = force_udp
+        self.ommit_ping  = ommit_ping
+        self.encoding    = encoding
 
-    def test_tcp(self):
-        self.client = socket(AF_INET, SOCK_STREAM)
-        self.client.settimeout(10)
-        res = self.client.connect_ex(self.address)
-        self.client.close()
-        return res
+        self.__session_id    = 0
+        self.__reply_id      = const.USHRT_MAX - 1
+        self.__sock          = None
+        self.__is_connected  = False
 
-    def test_udp(self):
-        self.client = socket(AF_INET, SOCK_DGRAM)
-        self.client.settimeout(10)
-        return True
-
-
-class ZK(object):
-    """ZK main class - handles ZKTeco device communication"""
-
-    def __init__(self, ip, port=4370, timeout=60, password=0, force_udp=False,
-                 ommit_ping=False, verbose=False, encoding='UTF-8'):
-        self.address = (ip, port)
-        self.ip = ip
-        self.port = port
-        self.timeout = timeout
-        self.password = password
-        self.force_udp = force_udp
-        self.ommit_ping = ommit_ping
-        self.verbose = verbose
-        self.encoding = encoding
-        self.helper = ZK_helper(ip, port)
-
-        self.__session_id = 0
-        self.__reply_id = const.USHRT_MAX - 1
-        self.__sock = None
-        self.__is_connected = False
-        self.__data_recv = None
-        self.__data = None
+    # ------------------------------------------------------------------ #
+    # Connection                                                           #
+    # ------------------------------------------------------------------ #
 
     def connect(self):
-        """Connect to the device"""
         if not self.ommit_ping:
-            if not self.helper.test_ping():
-                raise ZKNetworkError(f"Host {self.ip} is unreachable")
+            if not self._test_tcp_reachable():
+                raise ZKNetworkError(f"Host {self.ip}:{self.port} is unreachable")
 
-        if self.force_udp:
-            self.__sock = socket(AF_INET, SOCK_DGRAM)
-        else:
-            self.__sock = socket(AF_INET, SOCK_STREAM)
-
+        self.__sock = (socket(AF_INET, SOCK_DGRAM)
+                       if self.force_udp
+                       else socket(AF_INET, SOCK_STREAM))
         self.__sock.settimeout(self.timeout)
 
         try:
@@ -119,40 +74,37 @@ class ZK(object):
                 self.__sock.connect(self.address)
 
             self.__session_id = 0
-            self.__reply_id = const.USHRT_MAX - 1
+            self.__reply_id   = const.USHRT_MAX - 1
 
-            cmd_response = self.__send_command(const.CMD_CONNECT)
-            if cmd_response.get('status'):
-                self.__session_id = cmd_response.get('session_id', 0)
+            resp = self._send_command(const.CMD_CONNECT)
+            if resp.get('status'):
+                self.__session_id  = resp.get('session_id', 0)
                 self.__is_connected = True
 
                 if self.password:
-                    pwd_response = self.__send_command(
+                    pr = self._send_command(
                         const.CMD_COMMITPWD,
                         make_commkey(self.password, self.__session_id)
                     )
-                    if not pwd_response.get('status'):
+                    if not pr.get('status'):
                         raise ZKErrorConnection("Password authentication failed")
 
-                self.__send_command(const.CMD_ENABLE_CLOCK)
+                self._send_command(const.CMD_ENABLE_CLOCK)
                 return self
 
             raise ZKErrorConnection("Device refused connection")
 
-        except timeout:
+        except sock_timeout:
             raise ZKNetworkError(f"Connection to {self.ip}:{self.port} timed out")
-        except ZKNetworkError:
-            raise
-        except ZKErrorConnection:
+        except (ZKNetworkError, ZKErrorConnection):
             raise
         except Exception as e:
             raise ZKErrorConnection(f"Connection error: {e}")
 
     def disconnect(self):
-        """Disconnect from device"""
         try:
-            if self.__is_connected:
-                self.__send_command(const.CMD_EXIT)
+            if self.__is_connected and self.__sock:
+                self._send_command(const.CMD_EXIT)
         except Exception:
             pass
         finally:
@@ -164,249 +116,253 @@ class ZK(object):
                     pass
                 self.__sock = None
 
-    def __send_command(self, command, data=b'', response_size=1024):
-        """Send command to device and receive response"""
+    def _test_tcp_reachable(self) -> bool:
+        try:
+            s = socket(AF_INET, SOCK_STREAM)
+            s.settimeout(5)
+            ok = s.connect_ex(self.address) == 0
+            s.close()
+            return ok
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ #
+    # Internal packet layer                                                #
+    # ------------------------------------------------------------------ #
+
+    def _send_command(self, command, data=b'', response_size=1024):
         if command == const.CMD_CONNECT:
             self.__session_id = 0
-            self.__reply_id = const.USHRT_MAX - 1
+            self.__reply_id   = const.USHRT_MAX - 1
 
         self.__reply_id = (self.__reply_id + 1) % const.USHRT_MAX
-
-        buf = self.__create_header(command, data)
+        buf = self._build_packet(command, data)
 
         try:
             if self.force_udp:
                 self.__sock.sendto(buf, self.address)
-                self.__data_recv, _ = self.__sock.recvfrom(response_size)
+                raw, _ = self.__sock.recvfrom(response_size)
             else:
                 self.__sock.send(buf)
-                self.__data_recv = self.__receive_response(response_size)
+                raw = self._recv_tcp(response_size)
 
-            if len(self.__data_recv) < 8:
-                raise ZKErrorResponse("Response too short")
+            if len(raw) < 8:
+                raise ZKErrorResponse("Response packet too short")
 
-            # Parse response header
-            res_code, _, _, res_session_id, res_reply_id = unpack('<HHHHI', self.__data_recv[:12]) if len(self.__data_recv) >= 12 else (0, 0, 0, 0, 0)
+            res_code       = unpack('<H', raw[0:2])[0]
+            res_session_id = unpack('<H', raw[4:6])[0]
 
-            if len(self.__data_recv) >= 8:
-                res_code = unpack('<H', self.__data_recv[0:2])[0]
-                res_session_id = unpack('<H', self.__data_recv[4:6])[0]
+            if command == const.CMD_CONNECT:
+                self.__session_id = res_session_id
 
-                if command == const.CMD_CONNECT:
-                    self.__session_id = res_session_id
+            return {
+                'status':     res_code in (const.CMD_ACK_OK, const.CMD_ACK_UNAUTH),
+                'code':       res_code,
+                'session_id': res_session_id,
+                'data':       raw[8:] if len(raw) > 8 else b''
+            }
 
-                return {
-                    'status': res_code in (const.CMD_ACK_OK, const.CMD_ACK_UNAUTH),
-                    'code': res_code,
-                    'session_id': res_session_id,
-                    'data': self.__data_recv[8:] if len(self.__data_recv) > 8 else b''
-                }
-
-        except timeout:
-            raise ZKNetworkError(f"Command {command} timed out")
+        except sock_timeout:
+            raise ZKNetworkError(f"Command {command:#06x} timed out")
+        except (ZKNetworkError, ZKErrorResponse):
+            raise
         except Exception as e:
-            if 'timed out' in str(e).lower():
-                raise ZKNetworkError(f"Command {command} timed out")
-            raise ZKErrorResponse(f"Command {command} failed: {e}")
+            raise ZKErrorResponse(f"Command {command:#06x} failed: {e}")
 
-        return {'status': False, 'code': 0, 'data': b''}
-
-    def __receive_response(self, size=1024):
-        """Receive response from TCP connection"""
+    def _recv_tcp(self, size=1024) -> bytes:
+        """Read one complete ZK TCP response."""
         data = b''
-        while True:
-            try:
-                chunk = self.__sock.recv(size)
+        try:
+            # First 4 bytes are the payload length (big-endian)
+            header = b''
+            while len(header) < 4:
+                chunk = self.__sock.recv(4 - len(header))
+                if not chunk:
+                    break
+                header += chunk
+            if len(header) < 4:
+                return data
+            payload_len = unpack('>I', header)[0]
+            while len(data) < payload_len:
+                chunk = self.__sock.recv(payload_len - len(data))
                 if not chunk:
                     break
                 data += chunk
-                if len(data) >= 8:
-                    break
-            except timeout:
-                break
+        except sock_timeout:
+            pass
         return data
 
-    def __create_header(self, command, data=b''):
-        """Create command header packet"""
+    def _build_packet(self, command, data=b'') -> bytes:
         if isinstance(data, str):
             data = data.encode(self.encoding)
-        elif not isinstance(data, bytes):
+        elif not isinstance(data, (bytes, bytearray)):
             data = bytes(data)
 
-        chksum = 0
-        session_id = self.__session_id
-        reply_id = self.__reply_id
+        # Build header with zero checksum first
+        header = pack('<HHHH', command, 0, self.__session_id, self.__reply_id)
+        buf    = header + data
 
-        header = pack('<HHHH', command, chksum, session_id, reply_id)
-        buf = header + data
-
-        # Recalculate checksum
+        # XOR checksum over 16-bit words
         chksum = 0
         for i in range(0, len(buf) - 1, 2):
-            word = unpack('<H', buf[i:i+2])[0]
-            chksum ^= word
+            chksum ^= unpack('<H', buf[i:i+2])[0]
 
-        buf = pack('<HHHH', command, chksum, session_id, reply_id) + data
-        return pack('>I', len(buf)) + buf if not self.force_udp else buf
+        payload = pack('<HHHH', command, chksum, self.__session_id, self.__reply_id) + data
 
-    def get_time(self):
-        """Get device time"""
-        cmd_response = self.__send_command(const.CMD_GET_TIME)
-        if cmd_response.get('status') and cmd_response.get('data'):
-            try:
-                time_data = unpack('<I', cmd_response['data'][:4])[0]
-                # ZK time encoding: seconds since 2000-01-01
-                second = time_data % 60
-                time_data //= 60
-                minute = time_data % 60
-                time_data //= 60
-                hour = time_data % 24
-                time_data //= 24
-                day = time_data % 31 + 1
-                time_data //= 31
-                month = time_data % 12 + 1
-                time_data //= 12
-                year = time_data + 2000
-                return datetime(year, month, day, hour, minute, second)
-            except Exception as e:
-                logger.error(f"Error parsing device time: {e}")
+        # TCP: prefix with 4-byte big-endian length; UDP: raw
+        return pack('>I', len(payload)) + payload if not self.force_udp else payload
+
+    # ------------------------------------------------------------------ #
+    # Public device API                                                    #
+    # ------------------------------------------------------------------ #
+
+    def get_time(self) -> datetime:
+        resp = self._send_command(const.CMD_GET_TIME)
+        if resp.get('status') and len(resp.get('data', b'')) >= 4:
+            return self._decode_time(unpack('<I', resp['data'][:4])[0])
         return datetime.now()
 
-    def set_time(self, timestamp=None):
-        """Set device time"""
+    def set_time(self, timestamp: datetime = None) -> bool:
         if timestamp is None:
             timestamp = datetime.now()
-        try:
-            t = (timestamp.year - 2000) * 12 * 31 * 24 * 60 * 60 + \
-                (timestamp.month - 1) * 31 * 24 * 60 * 60 + \
-                (timestamp.day - 1) * 24 * 60 * 60 + \
-                timestamp.hour * 60 * 60 + \
-                timestamp.minute * 60 + \
-                timestamp.second
-            cmd_response = self.__send_command(const.CMD_SET_TIME, pack('<I', t))
-            return cmd_response.get('status', False)
-        except Exception as e:
-            logger.error(f"Error setting device time: {e}")
-            return False
+        t = ((timestamp.year  - 2000) * 12 * 31 * 24 * 60 * 60 +
+             (timestamp.month - 1)    * 31 * 24 * 60 * 60 +
+             (timestamp.day   - 1)    * 24 * 60 * 60 +
+              timestamp.hour          * 60 * 60 +
+              timestamp.minute        * 60 +
+              timestamp.second)
+        return self._send_command(const.CMD_SET_TIME, pack('<I', t)).get('status', False)
 
-    def get_users(self):
-        """Get all users from device"""
+    def get_users(self) -> List[User]:
         users = []
-        cmd_response = self.__send_command(const.CMD_DB_RRQ, const.FC_PC_USERS)
-        if not cmd_response.get('status'):
+        resp  = self._send_command(const.CMD_DB_RRQ, const.FC_PC_USERS)
+        if not resp.get('status'):
             return users
-
-        data = cmd_response.get('data', b'')
-        if not data:
-            return users
-
-        record_size = 28
-        for i in range(0, len(data) - record_size + 1, record_size):
+        data = resp.get('data', b'')
+        RSZ  = 28
+        for i in range(0, len(data) - RSZ + 1, RSZ):
             try:
-                uid, privilege, password, name, card, group_id, timezone, user_id = unpack(
-                    '<HB5s24sIHHI', data[i:i+record_size]
+                uid, priv, pwd_b, name_b, card, grp, tz, uid2 = unpack(
+                    '<HB5s24sIHHI', data[i:i+RSZ]
                 )
-                name = name.rstrip(b'\x00').decode(self.encoding, errors='ignore')
-                password = password.rstrip(b'\x00').decode('ascii', errors='ignore')
-                users.append(User(uid, name, privilege, password, group_id, user_id))
+                name = name_b.rstrip(b'\x00').decode(self.encoding, errors='ignore')
+                pwd  = pwd_b.rstrip(b'\x00').decode('ascii', errors='ignore')
+                users.append(User(uid, name, priv, pwd, grp, uid2, tz))
             except Exception as e:
-                logger.debug(f"Error parsing user record at offset {i}: {e}")
+                logger.debug(f"User parse error at {i}: {e}")
         return users
 
-    def get_attendance(self):
-        """Get all attendance records from device"""
+    def get_attendance(self) -> List[Attendance]:
+        """Pull all stored attendance records from device memory."""
         records = []
-        cmd_response = self.__send_command(const.CMD_ATTLOG_RRQ)
-        if not cmd_response.get('status'):
+        resp    = self._send_command(const.CMD_ATTLOG_RRQ)
+        if not resp.get('status'):
             return records
-
-        data = cmd_response.get('data', b'')
-        if not data:
-            return records
-
-        record_size = 40
-        for i in range(0, len(data) - record_size + 1, record_size):
+        data = resp.get('data', b'')
+        # ZK attendance record is 40 bytes; first 24 = user_id string
+        RSZ = 40
+        for i in range(0, len(data) - 29, RSZ):
             try:
-                user_id_raw, timestamp_raw, status, punch = unpack(
-                    '<24sIBB', data[i:i+30]
-                )
-                user_id = user_id_raw.rstrip(b'\x00').decode('ascii', errors='ignore')
-                dt = self._decode_time(timestamp_raw)
-                records.append(Attendance(user_id, dt, status, punch))
+                uid_raw = data[i:i+24].rstrip(b'\x00').decode('ascii', errors='ignore')
+                ts_raw  = unpack('<I', data[i+24:i+28])[0]
+                status  = data[i+28] if len(data) > i+28 else 0
+                punch   = data[i+29] if len(data) > i+29 else 0
+                records.append(Attendance(uid_raw, self._decode_time(ts_raw), status, punch))
             except Exception as e:
-                logger.debug(f"Error parsing attendance record at offset {i}: {e}")
+                logger.debug(f"Attendance parse error at {i}: {e}")
         return records
 
-    def live_capture(self, new_timeout=10):
-        """Live capture attendance events"""
-        was_timeout = self.__sock.gettimeout() if self.__sock else new_timeout
+    def live_capture(self, event_timeout: int = 10) -> Generator[Optional[Attendance], None, None]:
+        """
+        Stream live attendance events from the device.
+
+        Yields:
+            Attendance object when a punch is detected.
+            None on timeout (heartbeat tick — caller can check is_running).
+            Raises StopIteration / returns when disconnected.
+        """
+        if not self.__sock or not self.__is_connected:
+            return
+
+        saved_timeout = self.__sock.gettimeout()
+        self.__sock.settimeout(event_timeout)
+
         try:
-            if self.__sock:
-                self.__sock.settimeout(new_timeout)
-            self.__send_command(const.CMD_REG_EVENT, pack('<I', const.EF_ATTLOG))
+            # Register for attendance log events
+            self._send_command(const.CMD_REG_EVENT, pack('<I', const.EF_ATTLOG))
+            logger.debug(f"Live capture started on {self.ip}")
 
             while self.__is_connected:
                 try:
+                    # Read raw event packet
                     if self.force_udp:
-                        data_recv, _ = self.__sock.recvfrom(1032)
+                        raw, _ = self.__sock.recvfrom(4096)
                     else:
-                        data_recv = self.__receive_response(1032)
+                        raw = self._recv_tcp(4096)
 
-                    if len(data_recv) >= 16:
-                        event_code = unpack('<H', data_recv[8:10])[0]
-                        if event_code == const.EF_ATTLOG and len(data_recv) >= 32:
-                            try:
-                                event_data = data_recv[16:]
-                                user_id_raw = event_data[:24].rstrip(b'\x00').decode('ascii', errors='ignore')
-                                timestamp_raw = unpack('<I', event_data[24:28])[0]
-                                status = event_data[28] if len(event_data) > 28 else 0
-                                punch = event_data[29] if len(event_data) > 29 else 0
-                                dt = self._decode_time(timestamp_raw)
-                                yield Attendance(user_id_raw, dt, status, punch)
-                            except Exception as e:
-                                logger.debug(f"Error parsing live event: {e}")
+                    if not raw or len(raw) < 8:
+                        yield None
+                        continue
 
-                except timeout:
-                    yield None  # Yield None to allow caller to check is_running
+                    # ZK event header: cmd(2) chk(2) session(2) reply(2) then payload
+                    evt_code = unpack('<H', raw[0:2])[0]
+
+                    # EF_ATTLOG event carries an extra 8-byte sub-header
+                    if evt_code == const.EF_ATTLOG and len(raw) >= 32:
+                        payload = raw[8:]         # strip 8-byte ZK header
+                        uid_raw = payload[:24].rstrip(b'\x00').decode('ascii', errors='ignore')
+                        if len(payload) >= 28:
+                            ts_raw = unpack('<I', payload[24:28])[0]
+                            status = payload[28] if len(payload) > 28 else 0
+                            punch  = payload[29] if len(payload) > 29 else 0
+                            dt     = self._decode_time(ts_raw)
+                            att    = Attendance(uid_raw, dt, status, punch)
+                            logger.info(f"[LIVE] {self.ip} → user={uid_raw} time={dt} status={status} punch={punch}")
+                            yield att
+                        continue
+
+                    yield None   # heartbeat / other event
+
+                except sock_timeout:
+                    yield None   # normal — no punch in this window
                 except Exception as e:
-                    logger.error(f"Live capture error: {e}")
+                    logger.error(f"Live capture recv error on {self.ip}: {e}")
+                    self.__is_connected = False
                     break
 
         finally:
             try:
-                self.__send_command(const.CMD_CANCELCAPTURE)
-                if self.__sock:
-                    self.__sock.settimeout(was_timeout)
+                self._send_command(const.CMD_CANCELCAPTURE)
             except Exception:
                 pass
+            try:
+                if self.__sock:
+                    self.__sock.settimeout(saved_timeout)
+            except Exception:
+                pass
+            logger.debug(f"Live capture stopped on {self.ip}")
 
-    def clear_attendance(self):
-        """Clear all attendance records from device"""
-        cmd_response = self.__send_command(const.CMD_CLEAR_ATTLOG)
-        return cmd_response.get('status', False)
+    def clear_attendance(self) -> bool:
+        return self._send_command(const.CMD_CLEAR_ATTLOG).get('status', False)
 
-    def _decode_time(self, t):
-        """Decode ZK time integer to datetime"""
+    def enable_device(self) -> bool:
+        return self._send_command(const.CMD_ENABLE_CLOCK).get('status', False)
+
+    def disable_device(self) -> bool:
+        return self._send_command(const.CMD_STARTVERIFY).get('status', False)
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _decode_time(self, t: int) -> datetime:
         try:
-            second = t % 60
-            t //= 60
-            minute = t % 60
-            t //= 60
-            hour = t % 24
-            t //= 24
-            day = t % 31 + 1
-            t //= 31
-            month = t % 12 + 1
-            t //= 12
-            year = t + 2000
+            second = t % 60;  t //= 60
+            minute = t % 60;  t //= 60
+            hour   = t % 24;  t //= 24
+            day    = t % 31 + 1;  t //= 31
+            month  = t % 12 + 1;  t //= 12
+            year   = t + 2000
             return datetime(year, month, day, hour, minute, second)
         except Exception:
             return datetime.now()
-
-    def enable_device(self):
-        """Enable device"""
-        return self.__send_command(const.CMD_ENABLE_CLOCK).get('status', False)
-
-    def disable_device(self):
-        """Disable device"""
-        return self.__send_command(const.CMD_STARTVERIFY).get('status', False)
