@@ -182,8 +182,11 @@ class SyncEngine:
         summary['duplicates']     = dupes
         summary['errors']         = errors
 
-        # Also retry previously errored records
+        # Re-queue failed records with exponential backoff (never permanently dropped)
         self._retry_failed()
+
+        # Tell Laravel we are alive
+        self._send_heartbeat()
 
         if any(v for v in summary.values()):
             logger.info(
@@ -389,17 +392,89 @@ class SyncEngine:
             return 0, 0, 0
 
     def _retry_failed(self):
-        """Retry records that errored and still have retries remaining."""
-        failed = self.db.get_failed_attendance(self.retry_limit, self.tenant_id)
-        if not failed:
+        """
+        Re-queue failed records using exponential backoff.
+        Records are NEVER permanently dropped — they retry forever.
+        Backoff: 1m → 5m → 15m → 1h → 4h → 8h (capped at 8h thereafter).
+        """
+        import time as _time
+        backoff_minutes = [1, 5, 15, 60, 240, 480]   # minutes per retry tier
+
+        try:
+            with self.db._conn() as conn:
+                import sqlite3
+                # Find all error records regardless of retry count
+                sql = "SELECT id, retry_count, synced_at FROM attendance WHERE sync_status='error'"
+                params = []
+                if self.tenant_id:
+                    sql += " AND tenant_id=?"
+                    params.append(self.tenant_id)
+                rows = conn.execute(sql, params).fetchall()
+
+                now = _time.time()
+                requeued = 0
+                for row in rows:
+                    rid          = row[0]
+                    retry_count  = row[1] or 0
+                    last_attempt = row[2]  # synced_at is updated on each error mark
+
+                    # How long to wait before this retry
+                    tier    = min(retry_count, len(backoff_minutes) - 1)
+                    wait_s  = backoff_minutes[tier] * 60
+
+                    if last_attempt:
+                        try:
+                            import datetime
+                            last_dt = datetime.datetime.fromisoformat(str(last_attempt))
+                            elapsed = (datetime.datetime.now() - last_dt).total_seconds()
+                        except Exception:
+                            elapsed = wait_s + 1  # unknown — allow retry
+                    else:
+                        elapsed = wait_s + 1
+
+                    if elapsed >= wait_s:
+                        conn.execute(
+                            "UPDATE attendance SET sync_status='pending' WHERE id=?",
+                            (rid,)
+                        )
+                        requeued += 1
+
+                conn.commit()
+
+            if requeued:
+                logger.info(f"Re-queued {requeued} failed attendance records (backoff retry)")
+        except Exception as e:
+            logger.error(f"_retry_failed error: {e}")
+
+    def _send_heartbeat(self):
+        """POST agent status to Laravel so the dashboard knows we are alive."""
+        if not self._server_configured():
             return
-        # Reset status to pending so next cycle picks them up
-        ids = [r['id'] for r in failed]
-        ph  = ','.join('?' * len(ids))
-        self.db.execute(
-            f"UPDATE attendance SET sync_status='pending' WHERE id IN ({ph})", ids
-        )
-        logger.debug(f"Re-queued {len(ids)} failed attendance records for retry")
+        try:
+            devices_status = [
+                {
+                    'serial_number': sn,
+                    'ip':            d.ip,
+                    'connected':     d.is_connected(),
+                    'last_seen':     getattr(d, '_last_seen', None),
+                }
+                for sn, d in self.devices.items()
+            ]
+            stats = self.db.get_attendance_stats(self.tenant_id)
+            payload = {
+                'tenant_id':     self.tenant_id,
+                'agent_version': '2.2',
+                'devices':       devices_status,
+                'queue': {
+                    'pending':   stats.get('pending',   0),
+                    'synced':    stats.get('synced',    0),
+                    'error':     stats.get('error',     0),
+                    'duplicate': stats.get('duplicate', 0),
+                },
+            }
+            self._post(self._url('heartbeat'), payload)
+        except Exception as e:
+            logger.debug(f"Heartbeat error (non-fatal): {e}")
 
     # ── HTTP helpers ───────────────────────────────────────────────── #
 
